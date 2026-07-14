@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use bytes::{Bytes, BytesMut};
 
 use crate::commands;
+use crate::pubsub::PubSub;
 use crate::resp::{encode_command, parse_command};
 use crate::shard::Store;
 
@@ -89,11 +90,15 @@ pub fn replay(path: &Path, store: &Store) -> std::io::Result<()> {
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
     let mut buf = BytesMut::from(&data[..]);
+    // The AOF only ever contains write commands (see Command::is_write), so
+    // this replay-local registry never has real subscribers - it exists
+    // purely to satisfy execute()'s signature.
+    let pubsub = PubSub::new();
     loop {
         match parse_command(&mut buf) {
             Ok(Some(args)) if !args.is_empty() => {
                 if let Ok(cmd) = commands::parse(&args) {
-                    let _ = commands::execute(store, &cmd);
+                    let _ = commands::execute(store, &pubsub, &cmd);
                 }
             }
             Ok(Some(_)) => continue,

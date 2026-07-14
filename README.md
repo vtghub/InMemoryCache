@@ -5,24 +5,31 @@ A fast, local, Redis-compatible in-memory cache server, written in Rust.
 Speaks the Redis RESP protocol, so `redis-cli` and any existing Redis
 client library can talk to it without modification.
 
-## Status: Phase 1 — durable core KV engine
+## Status: Phase 2 — rich data structures + Pub/Sub
 
 - Sharded in-memory keyspace (16 shards, each independently locked) for
   low-contention concurrent access
 - RESP2 protocol support
-- Commands: `PING`, `ECHO`, `SET` (`EX`/`PX`/`NX`/`XX`), `GET`, `DEL`,
-  `EXISTS`, `EXPIRE`/`PEXPIRE`, `PERSIST`, `TTL`/`PTTL`, `INCR`/`DECR`/
-  `INCRBY`/`DECRBY`, `APPEND`, `MGET`/`MSET`, `TYPE`, `FLUSHALL`, `INFO`,
-  `CONFIG GET/SET` (stub), `BGSAVE`
+- String/counter commands: `PING`, `ECHO`, `SET` (`EX`/`PX`/`NX`/`XX`),
+  `GET`, `DEL`, `EXISTS`, `EXPIRE`/`PEXPIRE`, `PERSIST`, `TTL`/`PTTL`,
+  `INCR`/`DECR`/`INCRBY`/`DECRBY`, `APPEND`, `MGET`/`MSET`, `TYPE`,
+  `FLUSHALL`, `INFO`, `CONFIG GET/SET` (stub), `BGSAVE`
+- List: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`
+- Hash: `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`
+- Set: `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`
+- Sorted set: `ZADD`, `ZRANGE` (`WITHSCORES`), `ZSCORE`, `ZREM`
+- Pub/Sub: `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`
+- `WRONGTYPE` errors when a command targets a key of the wrong kind;
+  removing the last element of a List/Hash/Set/SortedSet deletes the key,
+  matching Redis semantics
 - Lazy + active-cycle key expiration
 - Approximated-LRU eviction when a shard exceeds `--max-keys-per-shard`
 - Durability: append-only file (AOF) log plus periodic full snapshots,
   replayed on startup (snapshot + AOF-since-snapshot, like Redis's
-  RDB+AOF hybrid)
+  RDB+AOF hybrid) — covers every data type above, not just strings
 
-Planned next: rich data structures (List/Hash/Set/SortedSet) + Pub/Sub,
-then replication/clustering. See the project's plan history for the full
-phased roadmap.
+Planned next: replication/clustering. See the project's plan history for
+the full phased roadmap.
 
 ## Running
 
@@ -57,4 +64,6 @@ cargo test
 Unit tests cover the RESP codec; integration tests (`crates/server/tests`)
 spawn the real server binary and drive it with the `redis` crate, covering
 get/set/expire, INCR/APPEND, AOF-restart recovery, snapshot-restart
-recovery, and LRU eviction bounds.
+recovery, LRU eviction bounds, List/Hash/Set/SortedSet operations
+(including the delete-on-empty prune behavior), `WRONGTYPE` errors,
+Pub/Sub delivery, and restart recovery of the rich data types.

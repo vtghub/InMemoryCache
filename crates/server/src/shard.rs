@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -14,12 +14,22 @@ const EVICTION_SAMPLE_SIZE: usize = 5;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     Str(Bytes),
+    List(VecDeque<Bytes>),
+    Hash(HashMap<Bytes, Bytes>),
+    Set(HashSet<Bytes>),
+    /// member -> score; order is computed on read rather than maintained,
+    /// since v1 only needs whole-range/index-range reads (see ZRANGE).
+    ZSet(HashMap<Bytes, f64>),
 }
 
 impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Str(_) => "string",
+            Value::List(_) => "list",
+            Value::Hash(_) => "hash",
+            Value::Set(_) => "set",
+            Value::ZSet(_) => "zset",
         }
     }
 }
@@ -278,6 +288,22 @@ impl Store {
         default: impl FnOnce() -> Value,
         f: impl FnOnce(&mut Value) -> T,
     ) -> T {
+        self.with_entry_mut_prune(key, default, |v| (f(v), false))
+    }
+
+    /// Like `with_entry_mut`, but `f` also reports whether the key should
+    /// be pruned (removed) after the mutation — used by push/add commands
+    /// that pass `false` (adding never empties a collection) as well as
+    /// pop/remove commands that can empty a collection down to nothing,
+    /// which Redis semantics treat as deleting the key entirely. The prune
+    /// check runs under the same shard lock as the mutation, so it's
+    /// atomic with respect to concurrent operations on the same key.
+    pub fn with_entry_mut_prune<T>(
+        &self,
+        key: &Bytes,
+        default: impl FnOnce() -> Value,
+        f: impl FnOnce(&mut Value) -> (T, bool),
+    ) -> T {
         let idx = Self::shard_index(key);
         let mut shard = self.shards[idx].write();
         let now = now_ms();
@@ -299,7 +325,38 @@ impl Store {
             .get_mut(key.as_ref())
             .expect("just inserted or present");
         entry.last_access = clock;
-        f(&mut entry.value)
+        let (result, prune) = f(&mut entry.value);
+        if prune {
+            shard.map.remove(key.as_ref());
+        }
+        result
+    }
+
+    /// Applies `f` to the entry only if `key` already exists (no creation
+    /// on a miss), pruning the key afterward if `f` reports the
+    /// collection became empty. Returns `None` if the key is absent,
+    /// mirroring Redis semantics where e.g. `LPOP`/`SREM` on a missing key
+    /// is a no-op rather than something that materializes an empty
+    /// collection.
+    pub fn with_existing_entry_mut<T>(
+        &self,
+        key: &[u8],
+        f: impl FnOnce(&mut Value) -> (T, bool),
+    ) -> Option<T> {
+        let idx = Self::shard_index(key);
+        let mut shard = self.shards[idx].write();
+        let now = now_ms();
+        if shard.purge_if_expired(key, now) {
+            return None;
+        }
+        let clock = shard.tick();
+        let entry = shard.map.get_mut(key).expect("checked present above");
+        entry.last_access = clock;
+        let (result, prune) = f(&mut entry.value);
+        if prune {
+            shard.map.remove(key);
+        }
+        Some(result)
     }
 
     /// Iterates every live (non-expired) key/entry across all shards.
