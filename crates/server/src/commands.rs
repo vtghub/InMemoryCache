@@ -86,6 +86,13 @@ pub enum Command {
     Subscribe(Vec<Bytes>),
     Unsubscribe(Vec<Bytes>),
     Publish(Bytes, Bytes),
+
+    // Replication
+    Sync,
+
+    // Cluster
+    ClusterInfo,
+    ClusterSlots,
 }
 
 impl Command {
@@ -117,6 +124,51 @@ impl Command {
                 | Command::ZAdd(_, _)
                 | Command::ZRem(_, _)
         )
+    }
+
+    /// Every keyspace key this command touches, used by cluster-mode slot
+    /// routing to decide ownership (and, for multi-key commands, whether
+    /// all keys land in the same slot). Commands with no data keys — pings,
+    /// server introspection, pub/sub channel names, etc. — return an empty
+    /// list and are always allowed regardless of cluster topology.
+    pub fn keys(&self) -> Vec<&Bytes> {
+        match self {
+            Command::Set { key, .. }
+            | Command::Expire { key, .. }
+            | Command::Persist(key)
+            | Command::Ttl { key, .. }
+            | Command::Incr(key)
+            | Command::Decr(key)
+            | Command::IncrBy(key, _)
+            | Command::DecrBy(key, _)
+            | Command::Append(key, _)
+            | Command::Type(key)
+            | Command::LPush(key, _)
+            | Command::RPush(key, _)
+            | Command::LPop(key)
+            | Command::RPop(key)
+            | Command::LRange { key, .. }
+            | Command::LLen(key)
+            | Command::HSet(key, _)
+            | Command::HGet(key, _)
+            | Command::HDel(key, _)
+            | Command::HGetAll(key)
+            | Command::HExists(key, _)
+            | Command::SAdd(key, _)
+            | Command::SRem(key, _)
+            | Command::SMembers(key)
+            | Command::SIsMember(key, _)
+            | Command::ZAdd(key, _)
+            | Command::ZRange { key, .. }
+            | Command::ZScore(key, _)
+            | Command::ZRem(key, _)
+            | Command::Get(key) => vec![key],
+            Command::Del(keys) | Command::Exists(keys) | Command::MGet(keys) => {
+                keys.iter().collect()
+            }
+            Command::MSet(pairs) => pairs.iter().map(|(k, _)| k).collect(),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -325,6 +377,18 @@ pub fn parse(args: &[Bytes]) -> Result<Command, String> {
         }
         "BGSAVE" => Ok(Command::BgSave),
         "QUIT" => Ok(Command::Quit),
+        "SYNC" => Ok(Command::Sync),
+        "CLUSTER" => {
+            if rest.is_empty() {
+                return Err(arity_err("cluster"));
+            }
+            let sub = String::from_utf8_lossy(&rest[0]).to_ascii_uppercase();
+            match sub.as_str() {
+                "INFO" => Ok(Command::ClusterInfo),
+                "SLOTS" => Ok(Command::ClusterSlots),
+                _ => Err(format!("ERR unknown CLUSTER subcommand '{}'", sub)),
+            }
+        }
 
         "LPUSH" | "RPUSH" => {
             if rest.len() < 2 {
@@ -899,11 +963,18 @@ pub fn execute(store: &Store, pubsub: &PubSub, cmd: &Command) -> Reply {
             let n = pubsub.publish(channel, message.clone());
             Reply::Integer(n as i64)
         }
-        // SUBSCRIBE/UNSUBSCRIBE are intercepted in main.rs's connection loop
-        // before reaching execute(); these arms are an unreachable-in-practice
-        // safety net so `execute` stays a total function over `Command`.
+        // SUBSCRIBE/UNSUBSCRIBE, SYNC, and CLUSTER INFO/SLOTS are all
+        // intercepted in main.rs's connection loop before reaching
+        // execute() — the first two take over the connection, and the
+        // CLUSTER replies need topology data execute() doesn't have. These
+        // arms are an unreachable-in-practice safety net so `execute` stays
+        // a total function over `Command`.
         Command::Subscribe(_) | Command::Unsubscribe(_) => {
             Reply::Error("ERR SUBSCRIBE/UNSUBSCRIBE is not allowed in this context".to_string())
+        }
+        Command::Sync => Reply::Error("ERR SYNC is not allowed in this context".to_string()),
+        Command::ClusterInfo | Command::ClusterSlots => {
+            Reply::Error("ERR CLUSTER is not enabled on this node".to_string())
         }
     }
 }

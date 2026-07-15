@@ -379,6 +379,30 @@ impl Store {
         shard.map.insert(key, entry);
     }
 
+    /// Takes a single, globally-consistent snapshot of every live key by
+    /// holding *all* shard write locks simultaneously for the duration of
+    /// the copy. Unlike `for_each_live_entry` (which locks one shard at a
+    /// time and is fine for periodic disk snapshots), this guarantees no
+    /// write can be applied — and therefore no write can be missed or
+    /// double-counted — while the snapshot is being taken. Used for
+    /// replication full sync, where a new replica's initial state must
+    /// line up exactly with the point it starts receiving streamed writes
+    /// from. This briefly pauses all writes across the whole store; kept
+    /// deliberately synchronous (no `.await` while locks are held).
+    pub fn snapshot_all_locked(&self) -> Vec<(Bytes, Entry)> {
+        let guards: Vec<_> = self.shards.iter().map(|s| s.write()).collect();
+        let now = now_ms();
+        let mut out = Vec::new();
+        for shard in &guards {
+            for (k, e) in shard.map.iter() {
+                if !is_expired(e, now) {
+                    out.push((k.clone(), e.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// Background sweep: samples a handful of keys per shard and purges
     /// any that have expired, so idle expired keys don't linger forever.
     pub fn active_expire_cycle(&self) {

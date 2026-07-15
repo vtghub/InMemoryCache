@@ -169,6 +169,43 @@ pub fn parse_command(buf: &mut BytesMut) -> Result<Option<Vec<Bytes>>, RespError
     Ok(Some(args))
 }
 
+/// Parses a single bare RESP bulk-string reply (`$len\r\n...\r\n`) from
+/// `buf`, advancing past the consumed bytes. Returns `Ok(None)` if more
+/// data is needed. Used by the replica client to read the primary's
+/// initial full-sync payload, which — unlike every other reply in this
+/// server — isn't wrapped in a command array, so `parse_command` doesn't
+/// apply to it.
+pub fn parse_bulk_reply(buf: &mut BytesMut) -> Result<Option<Bytes>, RespError> {
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    if buf[0] != b'$' {
+        return Err(RespError::Protocol(format!(
+            "expected '$', got '{}'",
+            buf[0] as char
+        )));
+    }
+    let header_end = match find_crlf(buf) {
+        None => return Ok(None),
+        Some(p) => p,
+    };
+    let len: i64 = std::str::from_utf8(&buf[1..header_end])
+        .map_err(|_| RespError::Protocol("invalid bulk length".into()))?
+        .parse()
+        .map_err(|_| RespError::Protocol("invalid bulk length".into()))?;
+    if len < 0 {
+        return Err(RespError::Protocol("unexpected nil bulk reply".into()));
+    }
+    let data_start = header_end + 2;
+    let data_end = data_start + len as usize;
+    if buf.len() < data_end + 2 {
+        return Ok(None);
+    }
+    let data = Bytes::copy_from_slice(&buf[data_start..data_end]);
+    buf.advance(data_end + 2);
+    Ok(Some(data))
+}
+
 /// Tokio codec used on client connections: decodes RESP requests, encodes
 /// RESP replies.
 #[derive(Default)]
@@ -218,6 +255,20 @@ mod tests {
         let mut buf = BytesMut::from(&b"PING\r\n"[..]);
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(cmd, vec![Bytes::from_static(b"PING")]);
+    }
+
+    #[test]
+    fn parses_bulk_reply() {
+        let mut buf = BytesMut::from(&b"$5\r\nhello\r\n"[..]);
+        let data = parse_bulk_reply(&mut buf).unwrap().unwrap();
+        assert_eq!(data, Bytes::from_static(b"hello"));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn bulk_reply_returns_none_on_partial_input() {
+        let mut buf = BytesMut::from(&b"$5\r\nhel"[..]);
+        assert!(parse_bulk_reply(&mut buf).unwrap().is_none());
     }
 
     #[test]

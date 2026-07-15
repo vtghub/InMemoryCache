@@ -21,19 +21,27 @@ impl TestServer {
     }
 
     async fn spawn_in(data_dir: &Path, extra_args: &[&str]) -> Self {
+        let mut args: Vec<String> = vec![
+            "--bind".into(),
+            "127.0.0.1".into(),
+            "--port".into(),
+            "0".into(), // let the OS assign a free port; we read it back below
+            "--data-dir".into(),
+            data_dir.to_string_lossy().into_owned(),
+            "--snapshot-interval-secs".into(),
+            "0".into(), // disable the periodic timer; tests trigger BGSAVE explicitly
+        ];
+        args.extend(extra_args.iter().map(|s| s.to_string()));
+        Self::spawn_with_args(&args).await
+    }
+
+    /// Lower-level spawn for tests that need full control over the CLI
+    /// args (e.g. a fixed `--port` and `--cluster-nodes`, which must be
+    /// known before the process starts).
+    async fn spawn_with_args(args: &[String]) -> Self {
         let bin = env!("CARGO_BIN_EXE_imcache-server");
         let mut cmd = Command::new(bin);
-        cmd.arg("--bind")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg("0") // let the OS assign a free port; we read it back below
-            .arg("--data-dir")
-            .arg(data_dir)
-            .arg("--snapshot-interval-secs")
-            .arg("0") // disable the periodic timer; tests trigger BGSAVE explicitly
-            .args(extra_args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::null());
         let mut child = cmd.spawn().expect("spawn imcache-server");
         let port = read_ready_port(child.stdout.take().expect("piped stdout"));
         Self { child, port }
@@ -428,4 +436,238 @@ async fn restart_recovers_rich_types() {
 
     let zset: Vec<String> = conn.zrange("zset", 0, -1).await.unwrap();
     assert_eq!(zset, vec!["m1", "m2"]);
+}
+
+/// Reserves `n` distinct free ports by holding all of them open at once
+/// (so they can't collide with each other) and then releasing them right
+/// before the caller re-binds them — needed because a static cluster's
+/// `--cluster-nodes` list must name every node's port before any node has
+/// started.
+fn reserve_ports(n: usize) -> Vec<u16> {
+    let listeners: Vec<std::net::TcpListener> = (0..n)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port"))
+        .collect();
+    listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect()
+}
+
+#[tokio::test]
+async fn replication_basic() {
+    let (primary, _primary_dir) = TestServer::spawn().await;
+    let primary_addr = format!("127.0.0.1:{}", primary.port);
+
+    let replica_dir = tempfile::tempdir().expect("create temp data dir");
+    let replica = TestServer::spawn_in(replica_dir.path(), &["--replicaof", &primary_addr]).await;
+
+    let mut primary_conn = primary.client().await;
+    let mut replica_conn = replica.client().await;
+
+    // Wait for the replica's initial full sync to complete before writing,
+    // so we're specifically exercising the streamed-write path.
+    for _ in 0..30 {
+        let pong: String = redis::cmd("PING")
+            .query_async(&mut replica_conn)
+            .await
+            .unwrap();
+        if pong == "PONG" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _: () = primary_conn.set("repl-key", "repl-value").await.unwrap();
+
+    let mut got = None;
+    for _ in 0..40 {
+        let v: Option<String> = replica_conn.get("repl-key").await.unwrap();
+        if v.is_some() {
+            got = v;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        got.as_deref(),
+        Some("repl-value"),
+        "write on primary did not propagate to replica"
+    );
+
+    let err = replica_conn
+        .set::<_, _, ()>("x", "y")
+        .await
+        .expect_err("a direct write to a replica should be rejected");
+    assert_eq!(err.kind(), redis::ErrorKind::ReadOnly, "got: {err}");
+}
+
+#[tokio::test]
+async fn replica_full_sync_carries_existing_data() {
+    let (primary, _primary_dir) = TestServer::spawn().await;
+    let mut primary_conn = primary.client().await;
+    let _: () = primary_conn.set("pre-existing", "value").await.unwrap();
+
+    let primary_addr = format!("127.0.0.1:{}", primary.port);
+    let replica_dir = tempfile::tempdir().expect("create temp data dir");
+    let replica = TestServer::spawn_in(replica_dir.path(), &["--replicaof", &primary_addr]).await;
+    let mut replica_conn = replica.client().await;
+
+    let mut got = None;
+    for _ in 0..40 {
+        let v: Option<String> = replica_conn.get("pre-existing").await.unwrap();
+        if v.is_some() {
+            got = v;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        got.as_deref(),
+        Some("value"),
+        "initial full sync did not carry pre-existing data"
+    );
+}
+
+/// Mirrors `cluster::crc16` in the server crate (not reachable from an
+/// integration test, since this is a bin crate with no lib target) so the
+/// test can deterministically pick a key owned by node B rather than
+/// probing for one.
+fn crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+fn find_key_owned_by_node(node_index: usize, num_nodes: u32) -> String {
+    for i in 0.. {
+        let key = format!("probe-{i}");
+        let slot = crc16(key.as_bytes()) % 16384;
+        let owner = (slot as u32 * num_nodes / 16384) as usize;
+        if owner == node_index {
+            return key;
+        }
+        assert!(
+            i < 100_000,
+            "couldn't find a key owned by node {node_index}"
+        );
+    }
+    unreachable!()
+}
+
+#[tokio::test]
+async fn cluster_moved_redirect_and_correct_routing() {
+    let ports = reserve_ports(2);
+    let nodes_spec = format!("127.0.0.1:{},127.0.0.1:{}", ports[0], ports[1]);
+    let dir_a = tempfile::tempdir().expect("create temp data dir");
+    let dir_b = tempfile::tempdir().expect("create temp data dir");
+
+    let node_a = TestServer::spawn_with_args(&[
+        "--bind".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        ports[0].to_string(),
+        "--data-dir".into(),
+        dir_a.path().to_string_lossy().into_owned(),
+        "--snapshot-interval-secs".into(),
+        "0".into(),
+        "--cluster-nodes".into(),
+        nodes_spec.clone(),
+        "--cluster-self-index".into(),
+        "0".into(),
+    ])
+    .await;
+    let node_b = TestServer::spawn_with_args(&[
+        "--bind".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        ports[1].to_string(),
+        "--data-dir".into(),
+        dir_b.path().to_string_lossy().into_owned(),
+        "--snapshot-interval-secs".into(),
+        "0".into(),
+        "--cluster-nodes".into(),
+        nodes_spec.clone(),
+        "--cluster-self-index".into(),
+        "1".into(),
+    ])
+    .await;
+
+    let key_for_b = find_key_owned_by_node(1, 2);
+
+    // Writing a key owned by node B, through node A, must fail with MOVED.
+    let mut conn_a = node_a.client().await;
+    let err = conn_a
+        .set::<_, _, ()>(&key_for_b, "v")
+        .await
+        .expect_err("writing a foreign-slot key should be redirected");
+    assert_eq!(err.kind(), redis::ErrorKind::Moved, "got: {err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&ports[1].to_string()),
+        "MOVED should point at node B's port, got: {msg}"
+    );
+
+    // Writing it directly on node B (its actual owner) must succeed.
+    let mut conn_b = node_b.client().await;
+    let _: () = conn_b.set(&key_for_b, "owned-by-b").await.unwrap();
+    let v: String = conn_b.get(&key_for_b).await.unwrap();
+    assert_eq!(v, "owned-by-b");
+}
+
+#[tokio::test]
+async fn cluster_slots_command_reports_full_coverage() {
+    let ports = reserve_ports(2);
+    let nodes_spec = format!("127.0.0.1:{},127.0.0.1:{}", ports[0], ports[1]);
+    let dir_a = tempfile::tempdir().expect("create temp data dir");
+    let dir_b = tempfile::tempdir().expect("create temp data dir");
+
+    let node_a = TestServer::spawn_with_args(&[
+        "--bind".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        ports[0].to_string(),
+        "--data-dir".into(),
+        dir_a.path().to_string_lossy().into_owned(),
+        "--snapshot-interval-secs".into(),
+        "0".into(),
+        "--cluster-nodes".into(),
+        nodes_spec.clone(),
+        "--cluster-self-index".into(),
+        "0".into(),
+    ])
+    .await;
+    let _node_b = TestServer::spawn_with_args(&[
+        "--bind".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        ports[1].to_string(),
+        "--data-dir".into(),
+        dir_b.path().to_string_lossy().into_owned(),
+        "--snapshot-interval-secs".into(),
+        "0".into(),
+        "--cluster-nodes".into(),
+        nodes_spec,
+        "--cluster-self-index".into(),
+        "1".into(),
+    ])
+    .await;
+
+    let mut conn = node_a.client().await;
+    let slots: Vec<(i64, i64, (String, i64))> = redis::cmd("CLUSTER")
+        .arg("SLOTS")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(slots.len(), 2, "expected one contiguous range per node");
+    let total: i64 = slots.iter().map(|(start, end, _)| end - start + 1).sum();
+    assert_eq!(total, 16384);
 }
